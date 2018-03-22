@@ -12,9 +12,6 @@ import (
 	"time"
 )
 
-// Maximum number of TCP queries before we close the socket.
-const maxTCPQueries = 128
-
 // Handler is implemented by any value that implements ServeDNS.
 type Handler interface {
 	ServeDNS(w ResponseWriter, r *Msg)
@@ -262,6 +259,13 @@ type DecorateReader func(Reader) Reader
 // Implementations should never return a nil Writer.
 type DecorateWriter func(Writer) Writer
 
+// A message defines struct that is passed to UDP worker
+type message struct {
+	m []byte
+	u *net.UDPConn
+	s *SessionUDP
+}
+
 // A Server defines parameters for running an DNS server.
 type Server struct {
 	// Address to listen on, ":dns" if empty.
@@ -296,10 +300,36 @@ type Server struct {
 	DecorateReader DecorateReader
 	// DecorateWriter is optional, allows customization of the process that writes raw DNS messages.
 	DecorateWriter DecorateWriter
-
+	// UDP and TCP queues
+	queueUDP chan *message
+	queueTCP chan net.Conn
+	// Number of workers, if set to zero - use spawn goroutines instead
+	Workers int
 	// Shutdown handling
 	lock    sync.RWMutex
 	started bool
+}
+
+func (srv *Server) startWorkersUDP() {
+	srv.queueUDP = make(chan *message)
+	for i := 0; i < srv.Workers; i++ {
+		go func() {
+			for msg := range srv.queueUDP {
+				srv.serveQueueUDP(msg)
+			}
+		}()
+	}
+}
+
+func (srv *Server) startWorkersTCP() {
+	srv.queueTCP = make(chan net.Conn)
+	for i := 0; i < srv.Workers; i++ {
+		go func() {
+			for rw := range srv.queueTCP {
+				srv.serveQueueTCP(rw)
+			}
+		}()
+	}
 }
 
 // ListenAndServe starts a nameserver on the configured address in *Server.
@@ -309,6 +339,11 @@ func (srv *Server) ListenAndServe() error {
 	if srv.started {
 		return &Error{err: "server already started"}
 	}
+
+	if srv.Handler == nil {
+		srv.Handler = DefaultServeMux
+	}
+
 	addr := srv.Addr
 	if addr == "" {
 		addr = ":domain"
@@ -318,6 +353,9 @@ func (srv *Server) ListenAndServe() error {
 	}
 	switch srv.Net {
 	case "tcp", "tcp4", "tcp6":
+		srv.startWorkersTCP()
+		defer close(srv.queueTCP)
+
 		a, err := net.ResolveTCPAddr(srv.Net, addr)
 		if err != nil {
 			return err
@@ -333,6 +371,9 @@ func (srv *Server) ListenAndServe() error {
 		srv.lock.Lock() // to satisfy the defer at the top
 		return err
 	case "tcp-tls", "tcp4-tls", "tcp6-tls":
+		srv.startWorkersTCP()
+		defer close(srv.queueTCP)
+
 		network := "tcp"
 		if srv.Net == "tcp4-tls" {
 			network = "tcp4"
@@ -351,6 +392,9 @@ func (srv *Server) ListenAndServe() error {
 		srv.lock.Lock() // to satisfy the defer at the top
 		return err
 	case "udp", "udp4", "udp6":
+		srv.startWorkersUDP()
+		defer close(srv.queueUDP)
+
 		a, err := net.ResolveUDPAddr(srv.Net, addr)
 		if err != nil {
 			return err
@@ -380,9 +424,17 @@ func (srv *Server) ActivateAndServe() error {
 	if srv.started {
 		return &Error{err: "server already started"}
 	}
+
+	if srv.Handler == nil {
+		srv.Handler = DefaultServeMux
+	}
+
 	pConn := srv.PacketConn
 	l := srv.Listener
 	if pConn != nil {
+		srv.startWorkersUDP()
+		defer close(srv.queueUDP)
+
 		if srv.UDPSize == 0 {
 			srv.UDPSize = MinMsgSize
 		}
@@ -400,6 +452,9 @@ func (srv *Server) ActivateAndServe() error {
 		}
 	}
 	if l != nil {
+		srv.startWorkersTCP()
+		defer close(srv.queueTCP)
+
 		srv.started = true
 		srv.lock.Unlock()
 		e := srv.serveTCP(l)
@@ -439,7 +494,6 @@ func (srv *Server) getReadTimeout() time.Duration {
 }
 
 // serveTCP starts a TCP listener for the server.
-// Each request is handled in a separate goroutine.
 func (srv *Server) serveTCP(l net.Listener) error {
 	defer l.Close()
 
@@ -447,17 +501,6 @@ func (srv *Server) serveTCP(l net.Listener) error {
 		srv.NotifyStartedFunc()
 	}
 
-	reader := Reader(&defaultReader{srv})
-	if srv.DecorateReader != nil {
-		reader = srv.DecorateReader(reader)
-	}
-
-	handler := srv.Handler
-	if handler == nil {
-		handler = DefaultServeMux
-	}
-	rtimeout := srv.getReadTimeout()
-	// deadline is not used here
 	for {
 		rw, err := l.Accept()
 		srv.lock.RLock()
@@ -472,19 +515,19 @@ func (srv *Server) serveTCP(l net.Listener) error {
 			}
 			return err
 		}
-		go func() {
-			m, err := reader.ReadTCP(rw, rtimeout)
-			if err != nil {
+		if srv.Workers > 0 {
+			select {
+			case srv.queueTCP <- rw:
+			default:
 				rw.Close()
-				return
 			}
-			srv.serve(rw.RemoteAddr(), handler, m, nil, nil, rw)
-		}()
+		} else {
+			go srv.serveQueueTCP(rw)
+		}
 	}
 }
 
 // serveUDP starts a UDP listener for the server.
-// Each request is handled in a separate goroutine.
 func (srv *Server) serveUDP(l *net.UDPConn) error {
 	defer l.Close()
 
@@ -497,10 +540,6 @@ func (srv *Server) serveUDP(l *net.UDPConn) error {
 		reader = srv.DecorateReader(reader)
 	}
 
-	handler := srv.Handler
-	if handler == nil {
-		handler = DefaultServeMux
-	}
 	rtimeout := srv.getReadTimeout()
 	// deadline is not used here
 	for {
@@ -520,38 +559,29 @@ func (srv *Server) serveUDP(l *net.UDPConn) error {
 		if len(m) < headerSize {
 			continue
 		}
-		go srv.serve(s.RemoteAddr(), handler, m, l, s, nil)
+		msg := &message{m, l, s}
+		if srv.Workers > 0 {
+			srv.queueUDP <- msg
+		} else {
+			go srv.serveQueueUDP(msg)
+		}
 	}
+	return nil
 }
 
-// Serve a new connection.
-func (srv *Server) serve(a net.Addr, h Handler, m []byte, u *net.UDPConn, s *SessionUDP, t net.Conn) {
-	w := &response{tsigSecret: srv.TsigSecret, udp: u, tcp: t, remoteAddr: a, udpSession: s}
-	if srv.DecorateWriter != nil {
-		w.writer = srv.DecorateWriter(w)
-	} else {
-		w.writer = w
-	}
-
-	q := 0 // counter for the amount of TCP queries we get
-
-	reader := Reader(&defaultReader{srv})
-	if srv.DecorateReader != nil {
-		reader = srv.DecorateReader(reader)
-	}
-Redo:
+// Serve a new message.
+func (srv *Server) serveMsg(msg []byte, w *response) {
 	req := new(Msg)
-	err := req.Unpack(m)
+	err := req.Unpack(msg)
 	if err != nil { // Send a FormatError back
 		x := new(Msg)
 		x.SetRcodeFormatError(req)
 		w.WriteMsg(x)
-		goto Exit
+		return
 	}
 	if !srv.Unsafe && req.Response {
-		goto Exit
+		return
 	}
-
 	w.tsigStatus = nil
 	if w.tsigSecret != nil {
 		if t := req.IsTsig(); t != nil {
@@ -559,38 +589,68 @@ Redo:
 			if _, ok := w.tsigSecret[secret]; !ok {
 				w.tsigStatus = ErrKeyAlg
 			}
-			w.tsigStatus = TsigVerify(m, w.tsigSecret[secret], "", false)
+			w.tsigStatus = TsigVerify(msg, w.tsigSecret[secret], "", false)
 			w.tsigTimersOnly = false
 			w.tsigRequestMAC = req.Extra[len(req.Extra)-1].(*TSIG).MAC
 		}
 	}
-	h.ServeDNS(w, req) // Writes back to the client
+	srv.Handler.ServeDNS(w, req) // Writes back to the client
+}
 
-Exit:
-	if w.tcp == nil {
-		return
-	}
-	// TODO(miek): make this number configurable?
-	if q > maxTCPQueries { // close socket after this many queries
-		w.Close()
-		return
+// Serve a new UDP message.
+func (srv *Server) serveQueueUDP(in *message) {
+	w := &response{
+		tsigSecret: srv.TsigSecret,
+		udp:        in.u,
+		tcp:        nil,
+		remoteAddr: in.s.RemoteAddr(),
+		udpSession: in.s,
 	}
 
-	if w.hijacked {
-		return // client calls Close()
+	if srv.DecorateWriter != nil {
+		w.writer = srv.DecorateWriter(w)
+	} else {
+		w.writer = w
 	}
-	if u != nil { // UDP, "close" and return
-		w.Close()
-		return
+
+	srv.serveMsg(in.m, w)
+}
+
+// Serve a new TCP connection.
+func (srv *Server) serveQueueTCP(rw net.Conn) {
+	w := &response{
+		tsigSecret: srv.TsigSecret,
+		udp:        nil,
+		tcp:        rw,
+		remoteAddr: rw.RemoteAddr(),
+		udpSession: nil,
 	}
-	idleTimeout := tcpIdleTimeout
-	if srv.IdleTimeout != nil {
-		idleTimeout = srv.IdleTimeout()
+
+	reader := Reader(&defaultReader{srv})
+	if srv.DecorateReader != nil {
+		reader = srv.DecorateReader(reader)
 	}
-	m, err = reader.ReadTCP(w.tcp, idleTimeout)
-	if err == nil {
-		q++
-		goto Redo
+
+	if srv.DecorateWriter != nil {
+		w.writer = srv.DecorateWriter(w)
+	} else {
+		w.writer = w
+	}
+
+	for {
+		msg, err := reader.ReadTCP(w.tcp, tcpIdleTimeout)
+		if err != nil {
+			if neterr, ok := err.(net.Error); ok && neterr.Temporary() {
+				continue
+			}
+			break // tcp read packet failed
+		}
+
+		srv.serveMsg(msg, w)
+
+		if w.tcp == nil || w.hijacked {
+			return // client calls Close()
+		}
 	}
 	w.Close()
 	return
