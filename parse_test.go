@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+
+	"github.com/panjf2000/ants"
 )
 
 func TestDotInName(t *testing.T) {
@@ -1695,6 +1697,12 @@ func TestParseBadSVCB(t *testing.T) {
 			continue
 		}
 	}
+}
+
+func init() {
+	// to prevent error "leaked goroutines: too many goroutines running after dns test(s)"
+	// need to stop goroutine in the pool created by default
+	ants.Release()
 }
 
 func TestParseBadNAPTR(t *testing.T) {
