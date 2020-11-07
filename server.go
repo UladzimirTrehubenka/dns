@@ -78,6 +78,8 @@ type response struct {
 	udpSession     *SessionUDP       // oob data to get egress interface right
 	pcSession      net.Addr          // address to use when writing to a generic net.PacketConn
 	writer         Writer            // writer to output the raw DNS bits
+
+	wg sync.WaitGroup // for wait async write
 }
 
 // handleRefused returns a HandlerFunc that returns REFUSED for every request it gets.
@@ -588,8 +590,11 @@ func (srv *Server) serve(w *response) {
 	}
 
 	if w.udp != nil {
+		w.wg.Add(1)
 		// serve UDP
 		srv.serveDNS(w)
+
+		w.wg.Wait()
 
 		srv.wg.Done()
 		return
@@ -614,6 +619,7 @@ func (srv *Server) serve(w *response) {
 			// TODO(tmthrgd): handle error
 			break
 		}
+		w.wg.Add(1)
 		srv.serveDNS(w)
 		if w.closed {
 			break // Close() was called
@@ -625,6 +631,8 @@ func (srv *Server) serve(w *response) {
 		// idle timeout.
 		timeout = idleTimeout
 	}
+
+	w.wg.Wait()
 
 	if !w.hijacked {
 		w.Close()
@@ -641,6 +649,7 @@ func (srv *Server) serveDNS(w *response) {
 	dh, off, err := unpackMsgHdr(w.msg, 0)
 	if err != nil {
 		// Let client hang, they are sending crap; any reply can be used to amplify.
+		w.wg.Done()
 		return
 	}
 
@@ -673,6 +682,7 @@ func (srv *Server) serveDNS(w *response) {
 			srv.udpPool.Put(w.msg[:srv.UDPSize])
 		}
 
+		w.wg.Done()
 		return
 	}
 
@@ -693,7 +703,10 @@ func (srv *Server) serveDNS(w *response) {
 		srv.udpPool.Put(w.msg[:srv.UDPSize])
 	}
 
-	srv.Handler.ServeDNS(w, req) // Writes back to the client
+	go func() {
+		srv.Handler.ServeDNS(w, req) // Writes back to the client
+		w.wg.Done()
+	}()
 }
 
 func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
