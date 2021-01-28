@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/panjf2000/ants"
 )
 
 // aLongTimeAgo is a non-zero time, far in the past, used for
@@ -231,8 +229,8 @@ type Server struct {
 	// By default DefaultMsgAcceptFunc will be used.
 	MsgAcceptFunc MsgAcceptFunc
 
-	// Worker pool
-	wp *ants.PoolWithFunc
+	// messages queue
+	queue chan *response
 
 	// Max number of workers, if set to negative value (or zero by default) - spawn goroutines instead
 	Workers int
@@ -264,8 +262,11 @@ func (srv *Server) toWorker(w *response) {
 		return
 	}
 
-	if err := srv.wp.Invoke(w); err == nil {
+	select {
+	case srv.queue <- w:
 		return
+	default:
+		// no free worker - skip handling
 	}
 
 	if w.tcp != nil {
@@ -290,12 +291,14 @@ func (srv *Server) init() {
 	}
 
 	if srv.Workers > 0 {
-		var err error
-		srv.wp, err = ants.NewPoolWithFunc(srv.Workers, func(payload interface{}) {
-			srv.serve(payload.(*response))
-		})
-		if err != nil {
-			panic("dns: internal error: workers pool init failed")
+		srv.queue = make(chan *response)
+
+		for i := 0; i < srv.Workers; i++ {
+			go func() {
+				for msg := range srv.queue {
+					srv.serve(msg)
+				}
+			}()
 		}
 	}
 
@@ -337,8 +340,8 @@ func (srv *Server) ListenAndServe() error {
 
 	srv.init()
 	defer func() {
-		if srv.wp != nil {
-			srv.wp.Release()
+		if srv.Workers > 0 {
+			close(srv.queue)
 		}
 	}()
 
@@ -396,8 +399,8 @@ func (srv *Server) ActivateAndServe() error {
 
 	srv.init()
 	defer func() {
-		if srv.wp != nil {
-			srv.wp.Release()
+		if srv.Workers > 0 {
+			close(srv.queue)
 		}
 	}()
 
