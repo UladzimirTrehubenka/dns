@@ -15,7 +15,7 @@ import (
 )
 
 // Default maximum number of TCP queries before we close the socket.
-const maxTCPQueries = 128
+const maxTCPQueries = -1
 
 // aLongTimeAgo is a non-zero time, far in the past, used for
 // immediate cancelation of network operations.
@@ -550,13 +550,16 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 		limit = maxTCPQueries
 	}
 
+	var wgCo sync.WaitGroup
+
 	for q := 0; (q < limit || limit == -1) && srv.isStarted(); q++ {
 		m, err := reader.ReadTCP(w.tcp, timeout)
 		if err != nil {
 			// TODO(tmthrgd): handle error
 			break
 		}
-		srv.serveDNS(m, w)
+		wgCo.Add(1)
+		go srv.serveTCPPacket(&wgCo, m, w)
 		if w.closed {
 			break // Close() was called
 		}
@@ -568,6 +571,8 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 		timeout = idleTimeout
 	}
 
+	wgCo.Wait()
+
 	if !w.hijacked {
 		w.Close()
 	}
@@ -576,6 +581,12 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 	delete(srv.conns, w.tcp)
 	srv.lock.Unlock()
 
+	wg.Done()
+}
+
+// Serve a new TCP request.
+func (srv *Server) serveTCPPacket(wg *sync.WaitGroup, m []byte, w *response) {
+	srv.serveDNS(m, w)
 	wg.Done()
 }
 
